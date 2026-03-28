@@ -14,6 +14,8 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'quality-laundry-secret-2026';
 const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
 const ENABLE_ADMIN_TEST_PUSH = process.env.ENABLE_ADMIN_TEST_PUSH === 'true';
+const CHAT_EXPIRY_DAYS = 3;
+const CHAT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
 const parseFirebaseServiceAccount = () => {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
@@ -33,6 +35,7 @@ const parseFirebaseServiceAccount = () => {
 
 const firebaseServiceAccount = parseFirebaseServiceAccount();
 let firebaseAdminPromise = null;
+let lastExpiredChatCleanupRunAt = 0;
 
 
 // ==================== MongoDB ====================
@@ -98,6 +101,60 @@ const getUsersByIds = async (db, userIds) => {
     .toArray();
 };
 
+const cleanupExpiredChatData = async (db, { force = false, limit = 50 } = {}) => {
+  const now = Date.now();
+  if (!force && now - lastExpiredChatCleanupRunAt < CHAT_CLEANUP_INTERVAL_MS) {
+    return { skipped: true, reason: 'Cleanup belum jatuh tempo' };
+  }
+
+  lastExpiredChatCleanupRunAt = now;
+
+  const admin = await getFirebaseAdmin();
+  if (!admin || !FIREBASE_DATABASE_URL) {
+    return { skipped: true, reason: 'Firebase Realtime Database belum dikonfigurasi di backend' };
+  }
+
+  const cutoffDate = new Date(now - (CHAT_EXPIRY_DAYS * 24 * 60 * 60 * 1000));
+  const expiredOrders = await db.collection('orders')
+    .find({
+      $or: [
+        {
+          chatExpiresAt: { $lte: new Date(now) },
+          $or: [{ chatCleanedAt: { $exists: false } }, { chatCleanedAt: null }],
+        },
+        {
+          status: { $in: ['delivered', 'cancelled'] },
+          updatedAt: { $lte: cutoffDate },
+          $or: [{ chatCleanedAt: { $exists: false } }, { chatCleanedAt: null }],
+        },
+      ],
+    })
+    .project({ _id: 1 })
+    .limit(limit)
+    .toArray();
+
+  if (!expiredOrders.length) {
+    return { success: true, deletedOrders: 0, skipped: false };
+  }
+
+  const dbRef = admin.database();
+  await Promise.all(expiredOrders.map(async ({ _id }) => {
+    const orderId = _id.toString();
+    await Promise.all([
+      dbRef.ref(`chats/${orderId}`).remove(),
+      dbRef.ref(`chatMeta/${orderId}`).remove(),
+      dbRef.ref(`tracking/${orderId}`).remove(),
+    ]);
+  }));
+
+  await db.collection('orders').updateMany(
+    { _id: { $in: expiredOrders.map(({ _id }) => _id) } },
+    { $set: { chatCleanedAt: new Date(now) } }
+  );
+
+  return { success: true, deletedOrders: expiredOrders.length, skipped: false };
+};
+
 const sendPushNotification = async (db, users, { title, body, data = {} }) => {
   const admin = await getFirebaseAdmin();
   if (!admin) {
@@ -159,7 +216,10 @@ const sendPushNotification = async (db, users, { title, body, data = {} }) => {
 const ensureOrderAccess = (order, user) => {
   if (user.role === 'admin') return true;
   if (user.role === 'customer') return String(order.customerId) === String(user._id);
-  if (user.role === 'courier') return order.courierId && String(order.courierId) === String(user._id);
+  if (user.role === 'courier') {
+    if (order.courierId) return String(order.courierId) === String(user._id);
+    return order.status === 'pending';
+  }
   return false;
 };
 
@@ -566,6 +626,7 @@ app.post('/api/orders', auth(['customer']), async (req, res) => {
 app.get('/api/orders', auth(), async (req, res) => {
   try {
     const db = await getDB();
+    await cleanupExpiredChatData(db);
     let filter = {};
     if (req.user.role === 'customer') {
       filter.customerId = req.user._id;
@@ -674,6 +735,10 @@ app.put('/api/orders/:id/status', auth(['admin', 'courier']), async (req, res) =
 
     if (status === 'delivered') {
       update.paymentStatus = 'paid';
+    }
+
+    if (status === 'delivered' || status === 'cancelled') {
+      update.chatExpiresAt = new Date(Date.now() + (CHAT_EXPIRY_DAYS * 24 * 60 * 60 * 1000));
     }
 
     const { $push, ...setFields } = update;
@@ -1011,12 +1076,11 @@ app.get('/api/health', async (req, res) => {
 // ==================== CHAT CLEANUP (90 days) ====================
 app.delete('/api/admin/chat-cleanup', auth(['admin']), async (req, res) => {
   try {
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - 90);
+    const db = await getDB();
+    const result = await cleanupExpiredChatData(db, { force: true, limit: 200 });
     res.json({
-      message: 'Chat cleanup policy: messages older than 90 days',
-      cutoffDate: cutoffDate.toISOString(),
-      note: 'Firebase Realtime DB chat data should be cleaned via Firebase Admin SDK or scheduled Cloud Function'
+      message: `Chat cleanup policy: messages older than ${CHAT_EXPIRY_DAYS} days after order completion`,
+      result,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
