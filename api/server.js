@@ -377,6 +377,24 @@ app.put('/api/orders/:id/weight', auth(['admin']), async (req, res) => {
   }
 });
 
+// Update order payment method (admin only)
+app.put('/api/orders/:id/payment', auth(['admin']), async (req, res) => {
+  try {
+    const { paymentMethod, payLater } = req.body;
+    if (!paymentMethod) return res.status(400).json({ error: 'Metode pembayaran wajib diisi' });
+    const db = await getDB();
+    const order = await db.collection('orders').findOne({ _id: new ObjectId(req.params.id) });
+    if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
+    await db.collection('orders').updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { paymentMethod, payLater: payLater !== false, updatedAt: new Date() } }
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ==================== USERS (ADMIN) ====================
 
 // Update order pickup location (courier corrects customer coordinates)
