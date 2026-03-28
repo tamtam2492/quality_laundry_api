@@ -312,6 +312,30 @@ app.put('/api/orders/:id/status', auth(['admin', 'courier']), async (req, res) =
     const order = await db.collection('orders').findOne({ _id: new ObjectId(req.params.id) });
     if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
 
+    const allowedTransitions = {
+      admin: {
+        pending: ['confirmed', 'cancelled'],
+        pickup: ['washing'],
+        washing: ['done'],
+      },
+      courier: {
+        confirmed: ['pickup'],
+        done: ['delivery'],
+        delivery: ['delivered'],
+      },
+    };
+    const roleTransitions = allowedTransitions[req.user.role] || {};
+    const nextStatuses = roleTransitions[order.status] || [];
+    if (!nextStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Transisi status tidak diizinkan untuk role ini' });
+    }
+
+    if (req.user.role === 'courier' && order.courierId && status !== 'pickup') {
+      if (String(order.courierId) !== String(req.user._id)) {
+        return res.status(403).json({ error: 'Pesanan ini ditangani kurir lain' });
+      }
+    }
+
     const update = {
       status,
       updatedAt: new Date(),
