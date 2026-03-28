@@ -218,7 +218,7 @@ app.delete('/api/services/:id', auth(['admin']), async (req, res) => {
 // ==================== ORDERS ROUTES ====================
 app.post('/api/orders', auth(['customer']), async (req, res) => {
   try {
-    const { services, pickupAddress, pickupLat, pickupLng, pickupNote, paymentMethod } = req.body;
+    const { services, pickupAddress, pickupLat, pickupLng, pickupNote, paymentMethod, payLater } = req.body;
     if (!services || !services.length) return res.status(400).json({ error: 'Pilih minimal 1 layanan' });
     if (!pickupAddress) return res.status(400).json({ error: 'Alamat penjemputan wajib' });
 
@@ -238,6 +238,7 @@ app.post('/api/orders', auth(['customer']), async (req, res) => {
       pickupLng: pickupLng || null,
       pickupNote: pickupNote || '',
       paymentMethod: paymentMethod || 'cash',
+      payLater: payLater !== false, // default true (bayar nanti)
       paymentStatus: 'unpaid',
       status: 'pending',
       courierId: null,
