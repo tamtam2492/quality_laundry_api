@@ -31,6 +31,12 @@ const getDB = async () => {
   return cachedDb;
 };
 
+const trimText = (value, maxLength = 4000) => {
+  if (!value) return '';
+  const text = String(value);
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+};
+
 const seedDefaults = async (db) => {
   const serviceCount = await db.collection('services').countDocuments();
   if (serviceCount === 0) {
@@ -111,6 +117,54 @@ const seedDefaults = async (db) => {
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+
+app.post('/api/client-errors', async (req, res) => {
+  try {
+    const {
+      source,
+      severity,
+      message,
+      stackTrace,
+      screen,
+      action,
+      appVersion,
+      buildType,
+      deviceModel,
+      osVersion,
+      threadName,
+      isFatal,
+      occurredAt,
+    } = req.body || {};
+
+    if (!message) {
+      return res.status(400).json({ error: 'Message wajib diisi' });
+    }
+
+    const db = await getDB();
+    await db.collection('app_error_logs').insertOne({
+      source: trimText(source || 'android', 50),
+      severity: trimText(severity || 'error', 20),
+      message: trimText(message, 2000),
+      stackTrace: trimText(stackTrace, 20000),
+      screen: trimText(screen, 200),
+      action: trimText(action, 200),
+      appVersion: trimText(appVersion, 50),
+      buildType: trimText(buildType, 50),
+      deviceModel: trimText(deviceModel, 200),
+      osVersion: trimText(osVersion, 100),
+      threadName: trimText(threadName, 100),
+      isFatal: Boolean(isFatal),
+      occurredAt: occurredAt ? new Date(occurredAt) : new Date(),
+      ipAddress: req.ip,
+      userAgent: trimText(req.get('user-agent'), 500),
+      createdAt: new Date(),
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ==================== Auth Middleware ====================
 const auth = (roles = []) => {
@@ -242,7 +296,7 @@ app.post('/api/orders', auth(['customer']), async (req, res) => {
       status: 'pending',
       courierId: null,
       courierName: null,
-      statusHistory: [{ status: 'pending', time: new Date(), note: 'Pesanan dibuat' }],
+      statusHistory: [{ status: 'pending', time: new Date(), note: 'Pesanan dibuat, menunggu kurir' }],
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -267,7 +321,6 @@ app.get('/api/orders', auth(), async (req, res) => {
       filter.$or = [
         { courierId: req.user._id },
         { status: 'pending', courierId: null },
-        { status: 'confirmed', courierId: null },
       ];
     }
     // admin sees all
@@ -312,14 +365,19 @@ app.put('/api/orders/:id/status', auth(['admin', 'courier']), async (req, res) =
     const order = await db.collection('orders').findOne({ _id: new ObjectId(req.params.id) });
     if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
 
+    const courierCancelReasons = [
+      'Jarak terlalu jauh',
+      'Alamat tidak ditemukan',
+      'Customer tidak merespons',
+    ];
+
     const allowedTransitions = {
       admin: {
-        pending: ['confirmed', 'cancelled'],
-        pickup: ['washing'],
         washing: ['done'],
       },
       courier: {
-        confirmed: ['pickup'],
+        pending: ['pickup', 'cancelled'],
+        pickup: ['washing', 'cancelled'],
         done: ['delivery'],
         delivery: ['delivered'],
       },
@@ -328,6 +386,10 @@ app.put('/api/orders/:id/status', auth(['admin', 'courier']), async (req, res) =
     const nextStatuses = roleTransitions[order.status] || [];
     if (!nextStatuses.includes(status)) {
       return res.status(400).json({ error: 'Transisi status tidak diizinkan untuk role ini' });
+    }
+
+    if (req.user.role === 'courier' && status === 'cancelled' && !courierCancelReasons.includes(note)) {
+      return res.status(400).json({ error: 'Alasan pembatalan kurir tidak valid' });
     }
 
     if (req.user.role === 'courier' && order.courierId && status !== 'pickup') {
@@ -481,6 +543,56 @@ app.put('/api/users/:id/toggle', auth(['admin']), async (req, res) => {
   }
 });
 
+app.put('/api/users/:id', auth(['admin']), async (req, res) => {
+  try {
+    const { name, phone, email, password } = req.body;
+    if (!name || !phone) return res.status(400).json({ error: 'Nama dan nomor telepon wajib diisi' });
+
+    const db = await getDB();
+    const user = await db.collection('users').findOne({ _id: new ObjectId(req.params.id) });
+    if (!user) return res.status(404).json({ error: 'User tidak ditemukan' });
+    if (user.role !== 'customer') return res.status(400).json({ error: 'Menu ini hanya untuk data pelanggan' });
+
+    const phoneOwner = await db.collection('users').findOne({ phone, _id: { $ne: new ObjectId(req.params.id) } });
+    if (phoneOwner) return res.status(400).json({ error: 'Nomor telepon sudah dipakai user lain' });
+
+    const updateData = {
+      name,
+      phone,
+      email: email || '',
+      updatedAt: new Date(),
+    };
+    if (password && password.trim()) {
+      updateData.password = await bcrypt.hash(password.trim(), 10);
+    }
+
+    await db.collection('users').updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: updateData }
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/users/:id', auth(['admin']), async (req, res) => {
+  try {
+    const db = await getDB();
+    const user = await db.collection('users').findOne({ _id: new ObjectId(req.params.id) });
+    if (!user) return res.status(404).json({ error: 'User tidak ditemukan' });
+    if (user.role !== 'customer') return res.status(400).json({ error: 'Menu ini hanya untuk data pelanggan' });
+
+    await db.collection('users').deleteOne({ _id: new ObjectId(req.params.id) });
+    await db.collection('orders').deleteMany({ customerId: user._id });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ==================== SETTINGS ====================
 app.get('/api/settings', async (req, res) => {
   try {
@@ -515,7 +627,7 @@ app.get('/api/dashboard', auth(['admin']), async (req, res) => {
     const [totalOrders, todayOrders, pendingOrders, totalRevenue, totalCustomers] = await Promise.all([
       db.collection('orders').countDocuments(),
       db.collection('orders').countDocuments({ createdAt: { $gte: today, $lt: tomorrow } }),
-      db.collection('orders').countDocuments({ status: { $in: ['pending', 'confirmed', 'pickup', 'washing'] } }),
+      db.collection('orders').countDocuments({ status: { $nin: ['delivered', 'cancelled'] } }),
       db.collection('orders').aggregate([
         { $match: { paymentStatus: 'paid' } },
         { $group: { _id: null, total: { $sum: '$totalPrice' } } }
@@ -832,6 +944,16 @@ app.get('/api/admin/db-stats', auth(['admin']), async (req, res) => {
 
 // ==================== START SERVER ====================
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Quality Laundry API running on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`Quality Laundry API running on port ${PORT}`));
+
+server.on('error', (error) => {
+  if (error?.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} sedang dipakai proses lain. Hentikan proses itu atau jalankan server dengan PORT berbeda.`);
+    process.exit(1);
+  }
+
+  console.error('Gagal menjalankan server:', error);
+  process.exit(1);
+});
 
 export default app;
