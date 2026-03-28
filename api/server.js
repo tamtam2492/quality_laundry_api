@@ -377,6 +377,25 @@ app.put('/api/orders/:id/weight', auth(['admin']), async (req, res) => {
 });
 
 // ==================== USERS (ADMIN) ====================
+
+// Update order pickup location (courier corrects customer coordinates)
+app.put('/api/orders/:id/location', auth(['courier']), async (req, res) => {
+  try {
+    const { pickupLat, pickupLng } = req.body;
+    if (pickupLat == null || pickupLng == null) return res.status(400).json({ error: 'Koordinat wajib diisi' });
+    const db = await getDB();
+    const order = await db.collection('orders').findOne({ _id: new ObjectId(req.params.id) });
+    if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
+    await db.collection('orders').updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { pickupLat: parseFloat(pickupLat), pickupLng: parseFloat(pickupLng), updatedAt: new Date() } }
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/users', auth(['admin']), async (req, res) => {
   try {
     const db = await getDB();
