@@ -12,6 +12,27 @@ if (process.env.NODE_ENV !== 'production') {
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'quality-laundry-secret-2026';
+const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
+const ENABLE_ADMIN_TEST_PUSH = process.env.ENABLE_ADMIN_TEST_PUSH === 'true';
+
+const parseFirebaseServiceAccount = () => {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed.private_key) {
+      parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+    }
+    return parsed;
+  } catch (error) {
+    console.error('Invalid FIREBASE_SERVICE_ACCOUNT_JSON:', error.message);
+    return null;
+  }
+};
+
+const firebaseServiceAccount = parseFirebaseServiceAccount();
+let firebaseAdminPromise = null;
 
 
 // ==================== MongoDB ====================
@@ -36,6 +57,139 @@ const trimText = (value, maxLength = 4000) => {
   const text = String(value);
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 };
+
+const normalizeFcmTokens = (value) => {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((token) => typeof token === 'string' && token.trim()))];
+};
+
+const getFirebaseAdmin = async () => {
+  if (!firebaseServiceAccount) return null;
+  if (!firebaseAdminPromise) {
+    firebaseAdminPromise = (async () => {
+      const firebaseAdminModule = await import('firebase-admin');
+      const admin = firebaseAdminModule.default || firebaseAdminModule;
+
+      if (!admin.apps.length) {
+        admin.initializeApp({
+          credential: admin.credential.cert(firebaseServiceAccount),
+          databaseURL: FIREBASE_DATABASE_URL || undefined,
+        });
+      }
+
+      return admin;
+    })();
+  }
+
+  return firebaseAdminPromise;
+};
+
+const getUsersByIds = async (db, userIds) => {
+  const uniqueIds = [...new Set(userIds
+    .filter(Boolean)
+    .map((id) => id.toString()))]
+    .map((id) => new ObjectId(id));
+
+  if (!uniqueIds.length) return [];
+
+  return db.collection('users')
+    .find({ _id: { $in: uniqueIds }, active: true })
+    .project({ _id: 1, name: 1, role: 1, fcmTokens: 1 })
+    .toArray();
+};
+
+const sendPushNotification = async (db, users, { title, body, data = {} }) => {
+  const admin = await getFirebaseAdmin();
+  if (!admin) {
+    return { success: false, skipped: true, reason: 'Firebase Admin belum dikonfigurasi di backend' };
+  }
+
+  const recipients = users
+    .map((user) => ({ ...user, fcmTokens: normalizeFcmTokens(user.fcmTokens) }))
+    .filter((user) => user.fcmTokens.length > 0);
+
+  if (!recipients.length) {
+    return { success: false, skipped: true, reason: 'Tidak ada token FCM aktif untuk penerima' };
+  }
+
+  const tokenOwners = recipients.flatMap((user) => user.fcmTokens.map((token) => ({
+    userId: user._id.toString(),
+    token,
+  })));
+
+  const response = await admin.messaging().sendEachForMulticast({
+    tokens: tokenOwners.map((entry) => entry.token),
+    data: Object.fromEntries(
+      Object.entries({ title, body, ...data })
+        .filter(([, value]) => value != null && String(value).trim() !== '')
+        .map(([key, value]) => [key, String(value)])
+    ),
+    android: { priority: 'high' },
+  });
+
+  const invalidTokensByUser = new Map();
+  response.responses.forEach((item, index) => {
+    if (item.success) return;
+
+    const code = item.error?.code;
+    if (!['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(code)) {
+      return;
+    }
+
+    const owner = tokenOwners[index];
+    const tokens = invalidTokensByUser.get(owner.userId) || [];
+    tokens.push(owner.token);
+    invalidTokensByUser.set(owner.userId, tokens);
+  });
+
+  await Promise.all([...invalidTokensByUser.entries()].map(([userId, invalidTokens]) => (
+    db.collection('users').updateOne(
+      { _id: new ObjectId(userId) },
+      { $pull: { fcmTokens: { $in: invalidTokens } } }
+    )
+  )));
+
+  return {
+    success: true,
+    sent: response.successCount,
+    failed: response.failureCount,
+  };
+};
+
+const ensureOrderAccess = (order, user) => {
+  if (user.role === 'admin') return true;
+  if (user.role === 'customer') return String(order.customerId) === String(user._id);
+  if (user.role === 'courier') return order.courierId && String(order.courierId) === String(user._id);
+  return false;
+};
+
+const orderStatusLabel = (status) => ({
+  pending: 'Menunggu Jemput',
+  pickup: 'Sedang Dijemput',
+  washing: 'Sedang Diproses',
+  done: 'Siap Diantar',
+  delivery: 'Sedang Diantar',
+  delivered: 'Selesai',
+  cancelled: 'Dibatalkan',
+}[status] || status);
+
+const buildOrderStatusNotification = (order, status, note = '') => {
+  const label = orderStatusLabel(status);
+  const suffix = note ? ` (${trimText(note, 80)})` : '';
+
+  return {
+    title: `Update Pesanan ${order.orderNumber}`,
+    body: `Status pesanan berubah menjadi ${label}${suffix}`,
+    data: {
+      type: 'order_status',
+      orderId: order._id.toString(),
+      orderNumber: order.orderNumber,
+      status,
+    },
+  };
+};
+
+const isFirebaseConfigured = () => Boolean(firebaseServiceAccount);
 
 const seedDefaults = async (db) => {
   const serviceCount = await db.collection('services').countDocuments();
@@ -228,6 +382,88 @@ app.get('/api/auth/me', auth(), async (req, res) => {
   res.json({ user: { ...user, id: user._id } });
 });
 
+app.post('/api/users/me/fcm-token', auth(), async (req, res) => {
+  try {
+    const token = trimText(req.body?.token, 4096).trim();
+    if (!token) return res.status(400).json({ error: 'Token FCM wajib diisi' });
+
+    const db = await getDB();
+    await db.collection('users').updateMany(
+      { _id: { $ne: req.user._id }, fcmTokens: token },
+      { $pull: { fcmTokens: token } }
+    );
+
+    await db.collection('users').updateOne(
+      { _id: req.user._id },
+      {
+        $addToSet: { fcmTokens: token },
+        $set: { lastFcmTokenAt: new Date(), updatedAt: new Date() },
+      }
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/users/me/fcm-token', auth(), async (req, res) => {
+  try {
+    const token = trimText(req.body?.token, 4096).trim();
+    if (!token) return res.status(400).json({ error: 'Token FCM wajib diisi' });
+
+    const db = await getDB();
+    await db.collection('users').updateOne(
+      { _id: req.user._id },
+      {
+        $pull: { fcmTokens: token },
+        $set: { updatedAt: new Date() },
+      }
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/chat/notify', auth(), async (req, res) => {
+  try {
+    const { orderId, message } = req.body || {};
+    if (!orderId || !ObjectId.isValid(orderId)) {
+      return res.status(400).json({ error: 'Order ID tidak valid' });
+    }
+
+    const db = await getDB();
+    const order = await db.collection('orders').findOne({ _id: new ObjectId(orderId) });
+    if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
+    if (!ensureOrderAccess(order, req.user)) return res.status(403).json({ error: 'Akses ditolak' });
+
+    const adminUsers = await db.collection('users')
+      .find({ role: 'admin', active: true })
+      .project({ _id: 1, name: 1, role: 1, fcmTokens: 1 })
+      .toArray();
+    const participantUsers = await getUsersByIds(db, [order.customerId, order.courierId]);
+    const recipients = [...adminUsers, ...participantUsers]
+      .filter((user) => String(user._id) !== String(req.user._id));
+
+    const result = await sendPushNotification(db, recipients, {
+      title: `Pesan baru ${order.orderNumber}`,
+      body: `${req.user.name}: ${trimText(message, 120)}`,
+      data: {
+        type: 'chat_message',
+        orderId: order._id.toString(),
+        orderNumber: order.orderNumber,
+        senderRole: req.user.role,
+      },
+    });
+
+    res.json({ success: true, notification: result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ==================== SERVICES ROUTES ====================
 app.get('/api/services', async (req, res) => {
   try {
@@ -303,6 +539,22 @@ app.post('/api/orders', auth(['customer']), async (req, res) => {
 
     const result = await db.collection('orders').insertOne(order);
     order._id = result.insertedId;
+
+    const staffUsers = await db.collection('users')
+      .find({ role: { $in: ['admin', 'courier'] }, active: true })
+      .project({ _id: 1, name: 1, role: 1, fcmTokens: 1 })
+      .toArray();
+
+    await sendPushNotification(db, staffUsers, {
+      title: 'Pesanan laundry baru',
+      body: `${order.customerName} membuat pesanan ${order.orderNumber}`,
+      data: {
+        type: 'order_created',
+        orderId: order._id.toString(),
+        orderNumber: order.orderNumber,
+        status: order.status,
+      },
+    });
 
     res.json(order);
   } catch (e) {
@@ -428,6 +680,18 @@ app.put('/api/orders/:id/status', auth(['admin', 'courier']), async (req, res) =
     await db.collection('orders').updateOne(
       { _id: new ObjectId(req.params.id) },
       { $set: setFields, $push }
+    );
+
+    const notificationRecipients = [order.customerId];
+    if (status === 'done' && order.courierId) {
+      notificationRecipients.push(order.courierId);
+    }
+
+    const recipientUsers = await getUsersByIds(db, notificationRecipients);
+    await sendPushNotification(
+      db,
+      recipientUsers,
+      buildOrderStatusNotification(order, status, note)
     );
 
     res.json({ success: true });
@@ -647,13 +911,100 @@ app.get('/api/dashboard', auth(['admin']), async (req, res) => {
   }
 });
 
+app.get('/api/admin/notification-health', auth(['admin']), async (req, res) => {
+  try {
+    const db = await getDB();
+    const users = await db.collection('users')
+      .find({ active: true })
+      .project({ role: 1, fcmTokens: 1 })
+      .toArray();
+
+    const summary = {
+      admin: { users: 0, withTokens: 0, tokens: 0 },
+      courier: { users: 0, withTokens: 0, tokens: 0 },
+      customer: { users: 0, withTokens: 0, tokens: 0 },
+    };
+
+    users.forEach((user) => {
+      const role = ['admin', 'courier', 'customer'].includes(user.role) ? user.role : 'customer';
+      const tokens = normalizeFcmTokens(user.fcmTokens);
+      summary[role].users += 1;
+      summary[role].tokens += tokens.length;
+      if (tokens.length > 0) {
+        summary[role].withTokens += 1;
+      }
+    });
+
+    res.json({
+      firebaseConfigured: isFirebaseConfigured(),
+      firebaseDatabaseUrlConfigured: Boolean(FIREBASE_DATABASE_URL),
+      adminTestPushEnabled: ENABLE_ADMIN_TEST_PUSH,
+      summary,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/test-notification', auth(['admin']), async (req, res) => {
+  try {
+    if (!ENABLE_ADMIN_TEST_PUSH) {
+      return res.status(403).json({ error: 'Test notification dinonaktifkan di environment ini' });
+    }
+
+    const { userId, title, body } = req.body || {};
+    const targetUserId = userId || req.user._id.toString();
+    if (!ObjectId.isValid(targetUserId)) {
+      return res.status(400).json({ error: 'User ID tidak valid' });
+    }
+
+    const messageTitle = trimText(title || 'Tes notifikasi Quality Laundry', 120);
+    const messageBody = trimText(body || 'Push notification backend berhasil dikirim.', 240);
+
+    const db = await getDB();
+    const recipients = await getUsersByIds(db, [targetUserId]);
+    if (!recipients.length) {
+      return res.status(404).json({ error: 'User target tidak ditemukan atau tidak aktif' });
+    }
+
+    const result = await sendPushNotification(db, recipients, {
+      title: messageTitle,
+      body: messageBody,
+      data: {
+        type: 'admin_test',
+        targetUserId,
+      },
+    });
+
+    res.json({ success: true, notification: result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ==================== HEALTH ====================
 app.get('/api/health', async (req, res) => {
   try {
     const db = await getDB();
-    res.json({ status: 'ok', db: 'connected' });
+    res.json({
+      status: 'ok',
+      db: 'connected',
+      notifications: {
+        firebaseConfigured: isFirebaseConfigured(),
+        firebaseDatabaseUrlConfigured: Boolean(FIREBASE_DATABASE_URL),
+        adminTestPushEnabled: ENABLE_ADMIN_TEST_PUSH,
+      },
+    });
   } catch (e) {
-    res.json({ status: 'ok', db: 'error' });
+    res.json({
+      status: 'ok',
+      db: 'error',
+      notifications: {
+        firebaseConfigured: isFirebaseConfigured(),
+        firebaseDatabaseUrlConfigured: Boolean(FIREBASE_DATABASE_URL),
+        adminTestPushEnabled: ENABLE_ADMIN_TEST_PUSH,
+      },
+    });
   }
 });
 
