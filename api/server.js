@@ -266,6 +266,7 @@ app.get('/api/orders', auth(), async (req, res) => {
     } else if (req.user.role === 'courier') {
       filter.$or = [
         { courierId: req.user._id },
+        { status: 'pending', courierId: null },
         { status: 'confirmed', courierId: null },
       ];
     }
