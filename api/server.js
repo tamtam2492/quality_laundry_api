@@ -218,7 +218,7 @@ app.delete('/api/services/:id', auth(['admin']), async (req, res) => {
 // ==================== ORDERS ROUTES ====================
 app.post('/api/orders', auth(['customer']), async (req, res) => {
   try {
-    const { services, pickupAddress, pickupLat, pickupLng, pickupNote, paymentMethod, payLater } = req.body;
+    const { services, pickupAddress, pickupLat, pickupLng, pickupNote, paymentMethod } = req.body;
     if (!services || !services.length) return res.status(400).json({ error: 'Pilih minimal 1 layanan' });
     if (!pickupAddress) return res.status(400).json({ error: 'Alamat penjemputan wajib' });
 
@@ -237,8 +237,7 @@ app.post('/api/orders', auth(['customer']), async (req, res) => {
       pickupLat: pickupLat || null,
       pickupLng: pickupLng || null,
       pickupNote: pickupNote || '',
-      paymentMethod: paymentMethod || 'cash',
-      payLater: payLater !== false, // default true (bayar nanti)
+      paymentMethod: paymentMethod || 'belum ditentukan',
       paymentStatus: 'unpaid',
       status: 'pending',
       courierId: null,
@@ -404,14 +403,14 @@ app.put('/api/orders/:id/weight', auth(['admin']), async (req, res) => {
 // Update order payment method (admin only)
 app.put('/api/orders/:id/payment', auth(['admin']), async (req, res) => {
   try {
-    const { paymentMethod, payLater } = req.body;
+    const { paymentMethod } = req.body;
     if (!paymentMethod) return res.status(400).json({ error: 'Metode pembayaran wajib diisi' });
     const db = await getDB();
     const order = await db.collection('orders').findOne({ _id: new ObjectId(req.params.id) });
     if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
     await db.collection('orders').updateOne(
       { _id: new ObjectId(req.params.id) },
-      { $set: { paymentMethod, payLater: payLater !== false, updatedAt: new Date() } }
+      { $set: { paymentMethod, updatedAt: new Date() } }
     );
     res.json({ success: true });
   } catch (e) {
