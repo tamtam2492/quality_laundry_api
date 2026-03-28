@@ -551,7 +551,7 @@ app.put('/api/users/:id', auth(['admin']), async (req, res) => {
     const db = await getDB();
     const user = await db.collection('users').findOne({ _id: new ObjectId(req.params.id) });
     if (!user) return res.status(404).json({ error: 'User tidak ditemukan' });
-    if (user.role !== 'customer') return res.status(400).json({ error: 'Menu ini hanya untuk data pelanggan' });
+    if (!['customer', 'courier'].includes(user.role)) return res.status(400).json({ error: 'Menu ini hanya untuk data pelanggan dan kurir' });
 
     const phoneOwner = await db.collection('users').findOne({ phone, _id: { $ne: new ObjectId(req.params.id) } });
     if (phoneOwner) return res.status(400).json({ error: 'Nomor telepon sudah dipakai user lain' });
