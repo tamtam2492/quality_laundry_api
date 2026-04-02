@@ -1,9 +1,24 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { MongoClient, ObjectId } from 'mongodb';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import ExcelJS from 'exceljs';
+
+// ==================== Input Sanitizer ====================
+const sanitize = (str, maxLen = 500) => {
+  if (typeof str !== 'string') return str;
+  return str.replace(/[<>]/g, '').trim().slice(0, maxLen);
+};
+const sanitizeObj = (obj, fields) => {
+  const result = {};
+  for (const f of fields) {
+    if (obj[f] !== undefined) result[f] = typeof obj[f] === 'string' ? sanitize(obj[f]) : obj[f];
+  }
+  return result;
+};
 
 if (process.env.NODE_ENV !== 'production') {
   const dotenv = await import('dotenv');
@@ -11,7 +26,8 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 const MONGODB_URI = process.env.MONGODB_URI;
-const JWT_SECRET = process.env.JWT_SECRET || 'quality-laundry-secret-2026';
+if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
+const JWT_SECRET = process.env.JWT_SECRET;
 const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
 const ENABLE_ADMIN_TEST_PUSH = process.env.ENABLE_ADMIN_TEST_PUSH === 'true';
 const CHAT_EXPIRY_DAYS = 3;
@@ -281,7 +297,8 @@ const seedDefaults = async (db) => {
   // Seed admin user
   const adminCount = await db.collection('users').countDocuments({ role: 'admin' });
   if (adminCount === 0) {
-    const hash = await bcrypt.hash('admin123', 10);
+    const seedPwd = process.env.SEED_ADMIN_PASSWORD || 'admin123';
+    const hash = await bcrypt.hash(seedPwd, 10);
     await db.collection('users').insertOne({
       name: 'Admin',
       phone: '08123456789',
@@ -291,13 +308,14 @@ const seedDefaults = async (db) => {
       active: true,
       createdAt: new Date(),
     });
-    console.log('Default admin seeded');
+    console.log('Default admin seeded (change password immediately)');
   }
 
   // Seed courier user
   const courierCount = await db.collection('users').countDocuments({ role: 'courier' });
   if (courierCount === 0) {
-    const hash = await bcrypt.hash('kurir123', 10);
+    const seedPwdKurir = process.env.SEED_COURIER_PASSWORD || 'kurir123';
+    const hash = await bcrypt.hash(seedPwdKurir, 10);
     await db.collection('users').insertOne({
       name: 'Kurir Test',
       phone: '08111111111',
@@ -307,13 +325,14 @@ const seedDefaults = async (db) => {
       active: true,
       createdAt: new Date(),
     });
-    console.log('Default courier seeded');
+    console.log('Default courier seeded (change password immediately)');
   }
 
   // Seed customer user
   const customerCount = await db.collection('users').countDocuments({ role: 'customer' });
   if (customerCount === 0) {
-    const hash = await bcrypt.hash('pelanggan123', 10);
+    const seedPwdCustomer = process.env.SEED_CUSTOMER_PASSWORD || 'pelanggan123';
+    const hash = await bcrypt.hash(seedPwdCustomer, 10);
     await db.collection('users').insertOne({
       name: 'Pelanggan Test',
       phone: '08222222222',
@@ -323,14 +342,24 @@ const seedDefaults = async (db) => {
       active: true,
       createdAt: new Date(),
     });
-    console.log('Default customer seeded');
+    console.log('Default customer seeded (change password immediately)');
   }
 };
 
 // ==================== Express ====================
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',')
+  : ['https://quality-laundry-app.vercel.app'];
+
 const app = express();
-app.use(cors());
+app.use(helmet());
+app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
+
+// Rate limiting
+const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { error: 'Terlalu banyak request, coba lagi nanti' } });
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Terlalu banyak percobaan login' } });
+app.use('/api/', apiLimiter);
 
 app.post('/api/client-errors', async (req, res) => {
   try {
@@ -376,7 +405,7 @@ app.post('/api/client-errors', async (req, res) => {
 
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -416,7 +445,7 @@ app.post('/api/auth/register', async (req, res) => {
     const token = jwt.sign({ userId: result.insertedId.toString() }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token, user: { id: result.insertedId, name, phone, role: 'customer' } });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -433,7 +462,7 @@ app.post('/api/auth/login', async (req, res) => {
     const token = jwt.sign({ userId: user._id.toString() }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token, user: { id: user._id, name: user.name, phone: user.phone, role: user.role } });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -463,7 +492,7 @@ app.post('/api/users/me/fcm-token', auth(), async (req, res) => {
 
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -483,7 +512,7 @@ app.delete('/api/users/me/fcm-token', auth(), async (req, res) => {
 
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -507,20 +536,45 @@ app.post('/api/chat/notify', auth(), async (req, res) => {
     const recipients = [...adminUsers, ...participantUsers]
       .filter((user) => String(user._id) !== String(req.user._id));
 
-    const result = await sendPushNotification(db, recipients, {
-      title: `Pesan baru ${order.orderNumber}`,
-      body: `${req.user.name}: ${trimText(message, 120)}`,
-      data: {
-        type: 'chat_message',
-        orderId: order._id.toString(),
-        orderNumber: order.orderNumber,
-        senderRole: req.user.role,
-      },
-    });
+    const adminRecipients = recipients.filter((user) => user.role === 'admin');
+    const otherRecipients = recipients.filter((user) => user.role !== 'admin');
+    const chatPreview = trimText(message, 120);
+
+    const [adminResult, otherResult] = await Promise.all([
+      sendPushNotification(db, adminRecipients, {
+        title: trimText(order.customerName || `Pesanan ${order.orderNumber}`, 120),
+        body: `${req.user.name}: ${chatPreview} • ${order.orderNumber}`,
+        data: {
+          type: 'chat_message',
+          orderId: order._id.toString(),
+          orderNumber: order.orderNumber,
+          customerName: order.customerName || '',
+          senderRole: req.user.role,
+        },
+      }),
+      sendPushNotification(db, otherRecipients, {
+        title: trimText(req.user.name || 'Pesan baru', 120),
+        body: `${chatPreview} • ${order.orderNumber}`,
+        data: {
+          type: 'chat_message',
+          orderId: order._id.toString(),
+          orderNumber: order.orderNumber,
+          customerName: order.customerName || '',
+          senderRole: req.user.role,
+        },
+      }),
+    ]);
+
+    const result = {
+      success: adminResult.success || otherResult.success,
+      sent: (adminResult.sent || 0) + (otherResult.sent || 0),
+      failed: (adminResult.failed || 0) + (otherResult.failed || 0),
+      skipped: Boolean(adminResult.skipped && otherResult.skipped),
+    };
 
     res.json({ success: true, notification: result });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -531,27 +585,30 @@ app.get('/api/services', async (req, res) => {
     const services = await db.collection('services').find({ active: true }).toArray();
     res.json(services);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.post('/api/services', auth(['admin']), async (req, res) => {
   try {
     const db = await getDB();
-    const result = await db.collection('services').insertOne({ ...req.body, active: true });
-    res.json({ id: result.insertedId, ...req.body });
+    const allowed = sanitizeObj(req.body, ['name', 'category', 'price', 'unit', 'description', 'estimatedDays']);
+    const result = await db.collection('services').insertOne({ ...allowed, active: true });
+    res.json({ id: result.insertedId, ...allowed });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.put('/api/services/:id', auth(['admin']), async (req, res) => {
   try {
     const db = await getDB();
-    await db.collection('services').updateOne({ _id: new ObjectId(req.params.id) }, { $set: req.body });
+    const allowed = sanitizeObj(req.body, ['name', 'category', 'price', 'unit', 'description', 'estimatedDays', 'active']);
+    await db.collection('services').updateOne({ _id: new ObjectId(req.params.id) }, { $set: allowed });
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('services update error:', e);
+    res.status(500).json({ error: 'Gagal mengupdate layanan' });
   }
 });
 
@@ -561,7 +618,7 @@ app.delete('/api/services/:id', auth(['admin']), async (req, res) => {
     await db.collection('services').updateOne({ _id: new ObjectId(req.params.id) }, { $set: { active: false } });
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -618,7 +675,7 @@ app.post('/api/orders', auth(['customer']), async (req, res) => {
 
     res.json(order);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -651,22 +708,27 @@ app.get('/api/orders', auth(), async (req, res) => {
     const total = await db.collection('orders').countDocuments(filter);
     res.json({ orders, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.get('/api/orders/:id', auth(), async (req, res) => {
   try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Order ID tidak valid' });
+    }
+
     const db = await getDB();
     const order = await db.collection('orders').findOne({ _id: new ObjectId(req.params.id) });
     if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
-    // Customer can only see own orders
-    if (req.user.role === 'customer' && order.customerId.toString() !== req.user._id.toString()) {
+
+    if (!ensureOrderAccess(order, req.user)) {
       return res.status(403).json({ error: 'Akses ditolak' });
     }
+
     res.json(order);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -761,7 +823,7 @@ app.put('/api/orders/:id/status', auth(['admin', 'courier']), async (req, res) =
 
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -788,7 +850,7 @@ app.put('/api/orders/:id/weight', auth(['admin']), async (req, res) => {
 
     res.json({ success: true, weight: w, totalPrice: Math.round(newTotal) });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -806,7 +868,7 @@ app.put('/api/orders/:id/payment', auth(['admin']), async (req, res) => {
     );
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -817,16 +879,25 @@ app.put('/api/orders/:id/location', auth(['courier']), async (req, res) => {
   try {
     const { pickupLat, pickupLng } = req.body;
     if (pickupLat == null || pickupLng == null) return res.status(400).json({ error: 'Koordinat wajib diisi' });
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Order ID tidak valid' });
+    }
+
     const db = await getDB();
     const order = await db.collection('orders').findOne({ _id: new ObjectId(req.params.id) });
     if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
+
+    if (!order.courierId || String(order.courierId) !== String(req.user._id)) {
+      return res.status(403).json({ error: 'Hanya kurir yang menangani pesanan ini yang dapat mengubah koordinat' });
+    }
+
     await db.collection('orders').updateOne(
       { _id: new ObjectId(req.params.id) },
       { $set: { pickupLat: parseFloat(pickupLat), pickupLng: parseFloat(pickupLng), updatedAt: new Date() } }
     );
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -838,7 +909,7 @@ app.get('/api/users', auth(['admin']), async (req, res) => {
     const users = await db.collection('users').find(filter).project({ password: 0 }).toArray();
     res.json(users);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -856,7 +927,7 @@ app.post('/api/users/courier', auth(['admin']), async (req, res) => {
     });
     res.json({ id: result.insertedId, name, phone, role: 'courier' });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -868,7 +939,7 @@ app.put('/api/users/:id/toggle', auth(['admin']), async (req, res) => {
     await db.collection('users').updateOne({ _id: new ObjectId(req.params.id) }, { $set: { active: !user.active } });
     res.json({ success: true, active: !user.active });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -880,7 +951,10 @@ app.put('/api/users/:id', auth(['admin']), async (req, res) => {
     const db = await getDB();
     const user = await db.collection('users').findOne({ _id: new ObjectId(req.params.id) });
     if (!user) return res.status(404).json({ error: 'User tidak ditemukan' });
-    if (!['customer', 'courier'].includes(user.role)) return res.status(400).json({ error: 'Menu ini hanya untuk data pelanggan dan kurir' });
+    const isSelfAdminUpdate = user.role === 'admin' && String(user._id) === String(req.user._id);
+    if (!['customer', 'courier'].includes(user.role) && !isSelfAdminUpdate) {
+      return res.status(400).json({ error: 'Menu ini hanya untuk data pelanggan, kurir, atau akun admin sendiri' });
+    }
 
     const phoneOwner = await db.collection('users').findOne({ phone, _id: { $ne: new ObjectId(req.params.id) } });
     if (phoneOwner) return res.status(400).json({ error: 'Nomor telepon sudah dipakai user lain' });
@@ -902,7 +976,7 @@ app.put('/api/users/:id', auth(['admin']), async (req, res) => {
 
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -913,12 +987,24 @@ app.delete('/api/users/:id', auth(['admin']), async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User tidak ditemukan' });
     if (user.role !== 'customer') return res.status(400).json({ error: 'Menu ini hanya untuk data pelanggan' });
 
-    await db.collection('users').deleteOne({ _id: new ObjectId(req.params.id) });
-    await db.collection('orders').deleteMany({ customerId: user._id });
+    const activeOrders = await db.collection('orders').countDocuments({
+      customerId: user._id,
+      status: { $nin: ['delivered', 'cancelled'] },
+    });
+    if (activeOrders > 0) {
+      return res.status(400).json({ error: 'Pelanggan masih punya pesanan aktif dan tidak boleh dihapus' });
+    }
 
-    res.json({ success: true });
+    const deleteUserResult = await db.collection('users').deleteOne({ _id: new ObjectId(req.params.id) });
+    if (deleteUserResult.deletedCount !== 1) {
+      return res.status(500).json({ error: 'Data pelanggan gagal dihapus' });
+    }
+
+    const deleteOrdersResult = await db.collection('orders').deleteMany({ customerId: user._id });
+
+    res.json({ success: true, deletedOrders: deleteOrdersResult.deletedCount || 0 });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -929,18 +1015,18 @@ app.get('/api/settings', async (req, res) => {
     const settings = await db.collection('settings').findOne({ _key: 'store' });
     res.json(settings || {});
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.put('/api/settings', auth(['admin']), async (req, res) => {
   try {
     const db = await getDB();
-    const { _id, _key, ...data } = req.body;
-    await db.collection('settings').updateOne({ _key: 'store' }, { $set: data }, { upsert: true });
+    const allowed = sanitizeObj(req.body, ['namaLaundry', 'alamat', 'telepon', 'qrisImage', 'bankTransfer']);
+    await db.collection('settings').updateOne({ _key: 'store' }, { $set: allowed }, { upsert: true });
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -972,7 +1058,7 @@ app.get('/api/dashboard', auth(['admin']), async (req, res) => {
       totalCustomers,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1007,7 +1093,7 @@ app.get('/api/admin/notification-health', auth(['admin']), async (req, res) => {
       summary,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1043,7 +1129,7 @@ app.post('/api/admin/test-notification', auth(['admin']), async (req, res) => {
 
     res.json({ success: true, notification: result });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1083,7 +1169,7 @@ app.delete('/api/admin/chat-cleanup', auth(['admin']), async (req, res) => {
       result,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1177,15 +1263,14 @@ app.get('/api/admin/reports', auth(['admin']), async (req, res) => {
       }
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Download XLSX report
 app.get('/api/admin/reports/download', async (req, res) => {
   try {
-    // Support token via query param for browser download
-    const token = req.headers.authorization?.replace('Bearer ', '') || req.query.token;
+    const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Token diperlukan' });
     const decoded = jwt.verify(token, JWT_SECRET);
     const db = await getDB();
@@ -1301,7 +1386,7 @@ app.get('/api/admin/reports/download', async (req, res) => {
     await workbook.xlsx.write(res);
     res.end();
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1331,7 +1416,7 @@ app.delete('/api/admin/reports/cleanup', auth(['admin']), async (req, res) => {
       message: `${result.deletedCount} pesanan (selesai/batal) sebelum ${cutoff.toLocaleDateString('id-ID')} telah dihapus`
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1353,7 +1438,7 @@ app.get('/api/admin/db-stats', auth(['admin']), async (req, res) => {
       usagePercent: Math.round(((stats.storageSize || 0) / (512 * 1024 * 1024)) * 10000) / 100,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'Internal server error' });
   }
 });
 
